@@ -2,11 +2,16 @@ import * as THREE from 'three';
 import { buildOffAxisProjection } from './offaxis.js';
 import { createFire, updateFire } from './fire.js';
 
+// ─── Mobile detection ─────────────────────────────────────────────────────────
+const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
+              || ('ontouchstart' in window);
+
 // ─── Renderer ─────────────────────────────────────────────────────────────────
 
 const canvas = document.getElementById('canvas');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+// Cap DPR lower on mobile — halves fill rate cost on high-DPI phones
+renderer.setPixelRatio(Math.min(devicePixelRatio, isMobile ? 1.5 : 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setClearColor(0x000000, 1);
 
@@ -14,17 +19,17 @@ renderer.setClearColor(0x000000, 1);
 
 const scene = new THREE.Scene();
 
-// Optional: a subtle ground plane to catch fire glow
-const groundGeo  = new THREE.PlaneGeometry(3, 3);
-const groundMat  = new THREE.MeshStandardMaterial({ color: 0x1a0800, roughness: 1 });
-const ground     = new THREE.Mesh(groundGeo, groundMat);
+// Ground plane — positioned to meet the new fire base (y = -0.5)
+const groundGeo = new THREE.PlaneGeometry(3, 3);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x1a0800, roughness: 1 });
+const ground    = new THREE.Mesh(groundGeo, groundMat);
 ground.rotation.x = -Math.PI / 2;
-ground.position.set(0, -0.82, -0.5);
+ground.position.set(0, -0.52, -0.5);
 scene.add(ground);
 
 // Ambient glow from fire base
 const fireLight = new THREE.PointLight(0xff5500, 3, 4);
-fireLight.position.set(0, -0.6, -0.2);
+fireLight.position.set(0, -0.3, -0.3);
 scene.add(fireLight);
 
 // Very dim ambient so the ground plane is barely visible
@@ -57,10 +62,8 @@ function setEye(x, y, z) {
 }
 
 // ─── Fire system ──────────────────────────────────────────────────────────────
-
-const fire = createFire(scene, 4000);
-
-// Pulse the fire light intensity with the animation
+// Fewer particles on mobile — reduces both JS loop time and GPU fill rate
+const fire = createFire(scene, isMobile ? 1500 : 4000);
 let lightPhase = 0;
 
 // ─── Status UI helper ─────────────────────────────────────────────────────────
@@ -75,6 +78,7 @@ class HeadTracker {
     this.mode    = 'mouse';
     this._mouseZ = 1.5;
     this._initMouse();
+    this._initTouch();
     this._tryWebcam();
   }
 
@@ -91,12 +95,50 @@ class HeadTracker {
       this._mouseZ = THREE.MathUtils.clamp(this._mouseZ + e.deltaY * 0.001, 0.4, 2.8);
     }, { passive: true });
 
-    setStatus('Mouse mode — move to shift perspective | scroll to zoom');
+    setStatus(isMobile
+      ? 'Touch to shift perspective'
+      : 'Mouse mode — move to shift perspective | scroll to zoom');
+  }
+
+  _initTouch() {
+    // Single-finger drag → shift perspective
+    window.addEventListener('touchmove', (e) => {
+      if (this.mode !== 'mouse' || e.touches.length !== 1) return;
+      e.preventDefault();
+      const t = e.touches[0];
+      const nx = (t.clientX / window.innerWidth  - 0.5) * 2;
+      const ny = (t.clientY / window.innerHeight - 0.5) * 2;
+      setEye(nx * 0.45, -ny * 0.32, this._mouseZ);
+    }, { passive: false });
+
+    // Two-finger pinch → zoom
+    let _lastPinch = 0;
+    window.addEventListener('touchstart', (e) => {
+      if (e.touches.length === 2) {
+        _lastPinch = Math.hypot(
+          e.touches[0].clientX - e.touches[1].clientX,
+          e.touches[0].clientY - e.touches[1].clientY,
+        );
+      }
+    }, { passive: true });
+    window.addEventListener('touchmove', (e) => {
+      if (this.mode !== 'mouse' || e.touches.length !== 2) return;
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY,
+      );
+      this._mouseZ = THREE.MathUtils.clamp(
+        this._mouseZ + (_lastPinch - dist) * 0.005, 0.4, 2.8,
+      );
+      _lastPinch = dist;
+    }, { passive: true });
   }
 
   _tryWebcam() {
     if (typeof window.FaceMesh === 'undefined') {
-      setStatus('Mouse mode (MediaPipe unavailable) — move to shift perspective');
+      setStatus(isMobile
+        ? 'Touch to shift perspective (MediaPipe unavailable)'
+        : 'Mouse mode (MediaPipe unavailable) — move to shift perspective');
       return;
     }
 
@@ -136,10 +178,18 @@ class HeadTracker {
     video.style.display = 'none';
     document.body.appendChild(video);
 
+    // On mobile: halve the resolution and process every other frame
+    // — cuts MediaPipe CPU cost by ~75% with barely visible tracking difference
+    let _faceFrameCount = 0;
+    const faceFrameSkip = isMobile ? 2 : 1;
+
     const cam = new window.Camera(video, {
-      onFrame: async () => { await faceMesh.send({ image: video }); },
-      width:  320,
-      height: 240,
+      onFrame: async () => {
+        if (++_faceFrameCount % faceFrameSkip !== 0) return;
+        await faceMesh.send({ image: video });
+      },
+      width:  isMobile ? 160 : 320,
+      height: isMobile ? 120 : 240,
     });
 
     setStatus('Requesting camera…');
@@ -152,7 +202,9 @@ class HeadTracker {
       .catch(() => {
         this.mode = 'mouse';
         document.getElementById('permission-prompt').style.display = 'block';
-        setStatus('Mouse mode (camera denied) — move to shift perspective');
+        setStatus(isMobile
+          ? 'Touch to shift perspective (camera denied)'
+          : 'Mouse mode (camera denied) — move to shift perspective');
       });
   }
 }

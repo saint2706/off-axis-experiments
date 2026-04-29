@@ -1,5 +1,41 @@
 import * as THREE from 'three';
 
+// ─── Fast trig lookup tables (replaces Math.sin/cos in the 4k-particle hot loop) ──
+const TBL      = 4096;
+const TBL_MASK = TBL - 1;
+const INV_2PI  = TBL / (Math.PI * 2);
+const SIN_TBL  = new Float32Array(TBL);
+const COS_TBL  = new Float32Array(TBL);
+for (let i = 0; i < TBL; i++) {
+  const a = (i / TBL) * Math.PI * 2;
+  SIN_TBL[i] = Math.sin(a);
+  COS_TBL[i] = Math.cos(a);
+}
+function fastSin(x) { return SIN_TBL[(x * INV_2PI | 0) & TBL_MASK]; }
+function fastCos(x) { return COS_TBL[(x * INV_2PI | 0) & TBL_MASK]; }
+
+// ─── Fire colour palette LUTs (256 steps, eliminates per-particle function calls) ─
+const CLR_R = new Float32Array(256);
+const CLR_G = new Float32Array(256);
+const CLR_B = new Float32Array(256);
+for (let i = 0; i < 256; i++) {
+  const t = i / 255;
+  CLR_R[i] = t < 0.5 ? 0.8 + t * 0.4 : 1.0;
+  CLR_G[i] = t < 0.2  ? t * 0.5
+           : t < 0.5  ? 0.1 + ((t - 0.2) / 0.3) * 0.5
+           : t < 0.75 ? 0.6 + ((t - 0.5) / 0.25) * 0.4
+           : 1.0;
+  CLR_B[i] = t < 0.7 ? 0.0 : ((t - 0.7) / 0.3) * 0.5;
+}
+
+// ─── Alpha fade LUT (smoothstep 0.65→1.0) ─────────────────────────────────────
+const ALPHA_LUT = new Float32Array(256);
+for (let i = 0; i < 256; i++) {
+  const t = i / 255;
+  const s = t < 0.65 ? 0.0 : (t - 0.65) / 0.35;
+  ALPHA_LUT[i] = 1.0 - s * s * (3.0 - 2.0 * s);
+}
+
 // ─── Shaders ──────────────────────────────────────────────────────────────────
 
 const VERT = /* glsl */`
@@ -18,45 +54,20 @@ void main() {
 const FRAG = /* glsl */`
 varying vec3 vColor;
 
-float smoothstep_custom(float e0, float e1, float x) {
-  float t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
-  return t * t * (3.0 - 2.0 * t);
-}
-
 void main() {
   vec2  uv   = gl_PointCoord - vec2(0.5);
   float dist = length(uv);
   if (dist > 0.5) discard;
-  float alpha = 1.0 - smoothstep_custom(0.25, 0.5, dist);
+  float t = clamp((dist - 0.25) / 0.25, 0.0, 1.0);
+  float alpha = 1.0 - t * t * (3.0 - 2.0 * t);
   gl_FragColor = vec4(vColor * alpha, alpha);
 }
 `;
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function smoothstep(e0, e1, x) {
-  const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
-  return t * t * (3 - 2 * t);
-}
-
-// Fire colour palette: maps normalised age t ∈ [0,1] → RGB
-function fireR(t) {
-  return t < 0.5 ? 0.8 + t * 0.4 : 1.0;
-}
-function fireG(t) {
-  if (t < 0.2) return t * 0.5;                         // dark-red → red
-  if (t < 0.5) return 0.1 + ((t - 0.2) / 0.3) * 0.5; // red → orange
-  if (t < 0.75) return 0.6 + ((t - 0.5) / 0.25) * 0.4; // orange → yellow
-  return 1.0;
-}
-function fireB(t) {
-  return t < 0.7 ? 0.0 : ((t - 0.7) / 0.3) * 0.5; // slight blue at tip → near-white
-}
-
 // ─── Spawn / respawn a single particle ────────────────────────────────────────
 
 function respawn(i, sys) {
-  const angle = Math.random() * Math.PI * 2;
+  const angle  = Math.random() * Math.PI * 2;
   const radius = Math.sqrt(Math.random()); // uniform-disk sampling
   const bx = Math.cos(angle) * 0.22 * radius;
   const bz = Math.sin(angle) * 0.08 * radius;
@@ -64,17 +75,21 @@ function respawn(i, sys) {
   sys.baseX[i] = bx;
   sys.baseZ[i] = bz;
 
-  // Fire base sits at y = -0.8, slightly behind the virtual screen (z = -0.2)
-  sys.positions[i * 3 + 0] = bx;
-  sys.positions[i * 3 + 1] = -0.8;
-  sys.positions[i * 3 + 2] = -0.2 + bz;
+  const i3 = i * 3;
+  // Fire base centred on the virtual screen (y=-0.5 sits at screen-bottom edge,
+  // flame body rises through screen centre and beyond the top edge)
+  sys.positions[i3]     = bx;
+  sys.positions[i3 + 1] = -0.5;
+  sys.positions[i3 + 2] = -0.3 + bz;
 
-  sys.velocities[i * 3 + 0] = (Math.random() - 0.5) * 0.008;
-  sys.velocities[i * 3 + 1] = 0.012 + Math.random() * 0.018;
-  sys.velocities[i * 3 + 2] = (Math.random() - 0.5) * 0.004;
+  sys.velocities[i3]     = (Math.random() - 0.5) * 0.008;
+  sys.velocities[i3 + 1] = 0.012 + Math.random() * 0.018;
+  sys.velocities[i3 + 2] = (Math.random() - 0.5) * 0.004;
 
-  sys.ages[i] = 0;
+  sys.ages[i]     = 0;
   sys.lifetimes[i] = 60 + Math.floor(Math.random() * 90); // 60–150 frames
+  // Random size frozen at spawn — avoids Math.random() in the per-frame loop
+  sys.sizeBase[i]  = 16 + Math.random() * 12;
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -82,19 +97,34 @@ function respawn(i, sys) {
 /**
  * Create a fire particle system and add it to the scene.
  * @param {THREE.Scene} scene
- * @param {number} count  Number of particles (default 4000)
+ * @param {number} count  Number of particles (default 4000; use ~1500 on mobile)
  * @returns {Object} fireSys — pass to updateFire() each frame
  */
 export function createFire(scene, count = 4000) {
   const positions  = new Float32Array(count * 3);
   const colors     = new Float32Array(count * 3);
   const sizes      = new Float32Array(count);
-
   const velocities = new Float32Array(count * 3);
   const ages       = new Int32Array(count);
   const lifetimes  = new Int32Array(count);
   const baseX      = new Float32Array(count);
   const baseZ      = new Float32Array(count);
+  const sizeBase   = new Float32Array(count);
+  // Per-particle trig phase offsets — computed once, reused every frame
+  const phaseX1    = new Float32Array(count);   // i * 0.17
+  const phaseX2    = new Float32Array(count);   // i * 0.41
+  const phaseZ1    = new Float32Array(count);   // i * 0.23
+
+  for (let i = 0; i < count; i++) {
+    phaseX1[i] = i * 0.17;
+    phaseX2[i] = i * 0.41;
+    phaseZ1[i] = i * 0.23;
+    // Start all particles dead so they stagger in rather than popping all at once
+    ages[i]     = 999;
+    lifetimes[i] = 1;
+    sizeBase[i]  = 16;
+    positions[i * 3 + 1] = -100; // off-screen while dead
+  }
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
@@ -113,17 +143,8 @@ export function createFire(scene, count = 4000) {
   const points = new THREE.Points(geo, mat);
   scene.add(points);
 
-  const sys = { geo, points, count, positions, colors, sizes, velocities, ages, lifetimes, baseX, baseZ };
-
-  // Start all particles as dead so they stagger in rather than popping all at once
-  for (let i = 0; i < count; i++) {
-    ages[i] = 999;
-    lifetimes[i] = 1;
-    // Scatter them off-screen so the "dead" positions don't flash
-    positions[i * 3 + 1] = -100;
-  }
-
-  return sys;
+  return { geo, points, count, positions, colors, sizes, velocities, ages, lifetimes,
+           baseX, baseZ, sizeBase, phaseX1, phaseX2, phaseZ1 };
 }
 
 /**
@@ -131,39 +152,43 @@ export function createFire(scene, count = 4000) {
  * @param {Object} sys  Return value of createFire()
  */
 export function updateFire(sys) {
-  const { positions, velocities, colors, sizes, ages, lifetimes, count } = sys;
+  const { positions, velocities, colors, sizes, ages, lifetimes, count,
+          sizeBase, phaseX1, phaseX2, phaseZ1 } = sys;
   const time = performance.now() * 0.001;
+
+  // Pre-multiply time factors once per frame (saves count multiplications)
+  const t13 = time * 1.3;
+  const t31 = time * 3.1;
+  const t17 = time * 1.7;
 
   for (let i = 0; i < count; i++) {
     ages[i]++;
     const t = ages[i] / lifetimes[i]; // normalised age 0→1
 
-    if (t >= 1.0) {
-      respawn(i, sys);
-      continue;
-    }
+    if (t >= 1.0) { respawn(i, sys); continue; }
 
-    // Sin-harmonic turbulence — no external library required
-    const tx = Math.sin(time * 1.3 + i * 0.17) * 0.003
-             + Math.sin(time * 3.1 + i * 0.41) * 0.001;
-    const tz = Math.cos(time * 1.7 + i * 0.23) * 0.002;
+    const i3 = i * 3;
 
-    positions[i * 3 + 0] += velocities[i * 3 + 0] + tx;
-    positions[i * 3 + 1] += velocities[i * 3 + 1] * (1 - t * 0.4); // slow as it rises
-    positions[i * 3 + 2] += velocities[i * 3 + 2] + tz;
+    // Turbulence via LUT — far cheaper than Math.sin/cos on mobile
+    const tx = fastSin(t13 + phaseX1[i]) * 0.003 + fastSin(t31 + phaseX2[i]) * 0.001;
+    const tz = fastCos(t17 + phaseZ1[i]) * 0.002;
+
+    positions[i3]     += velocities[i3]     + tx;
+    positions[i3 + 1] += velocities[i3 + 1] * (1.0 - t * 0.4); // slow as it rises
+    positions[i3 + 2] += velocities[i3 + 2] + tz;
 
     // Slight lateral drag
-    velocities[i * 3 + 0] *= 0.995;
-    velocities[i * 3 + 2] *= 0.995;
+    velocities[i3]     *= 0.995;
+    velocities[i3 + 2] *= 0.995;
 
-    // Fade alpha into end-of-life
-    const alpha = 1.0 - smoothstep(0.65, 1.0, t);
+    const ti    = t * 255 | 0; // 0..254 LUT index (t < 1.0 guaranteed above)
+    const alpha = ALPHA_LUT[ti];
 
-    colors[i * 3 + 0] = fireR(t);
-    colors[i * 3 + 1] = fireG(t);
-    colors[i * 3 + 2] = fireB(t);
+    colors[i3]     = CLR_R[ti];
+    colors[i3 + 1] = CLR_G[ti];
+    colors[i3 + 2] = CLR_B[ti];
 
-    sizes[i] = (16 + Math.random() * 12) * (1 - t * 0.55) * alpha;
+    sizes[i] = sizeBase[i] * (1.0 - t * 0.55) * alpha;
   }
 
   sys.geo.attributes.position.needsUpdate = true;
