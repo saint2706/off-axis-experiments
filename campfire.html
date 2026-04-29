@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>Campfire</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    html,body{width:100%;height:100%;overflow:hidden;background:#050402;touch-action:none}
+    canvas{position:fixed;top:0;left:0;width:100%;height:100%;display:block}
+    #scene{pointer-events:none}
+    #noglmsg{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+      color:#ff8c00;font:18px/1.5 monospace;text-align:center;padding:20px}
+  </style>
+</head>
+<body>
+<canvas id="fire"></canvas>
+<canvas id="scene"></canvas>
+<p id="noglmsg">WebGL is not available in your browser.<br>Try updating or switching browsers.</p>
+<script>
+(function(){
+'use strict';
+
+// ── Device detection & sim resolution ──────────────────────────
+var isMobile = (window.innerWidth < 768) || ('ontouchstart' in window) ||
+               /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+var SIM_W = isMobile ? 256 : 512;
+var SIM_H = isMobile ? 256 : 512;
+
+// ── Campfire parameters (tuned from original) ───────────────────
+var C = {
+  color1:    [1.000, 1.000, 1.000],   // #ffffff  hot core
+  color2:    [1.000, 0.353, 0.000],   // #ff5a00  orange mid
+  color3:    [0.980, 0.925, 0.086],   // #faec16  yellow edge
+  colorBias: 0.8,
+  burnRate:  0.3,
+  diffuse:   1.33,
+  viscosity: 0.25,
+  expansion: 0.4,
+  swirl:     50.0,
+  drag:      0.35,
+  airSpeed:  12.0,
+  windX:     0.0,
+  windY:     0.75,
+  speed:     500.0
+};
+
+// ── Canvas & WebGL init ─────────────────────────────────────────
+var fc = document.getElementById('fire');
+var sc = document.getElementById('scene');
+
+var gl = fc.getContext('webgl',             {alpha:true, antialias:false, premultipliedAlpha:false, preserveDrawingBuffer:false}) ||
+         fc.getContext('experimental-webgl',{alpha:true, antialias:false, premultipliedAlpha:false, preserveDrawingBuffer:false});
+
+if (!gl) {
+  document.getElementById('noglmsg').style.display = 'block';
+  return;
+}
+
+// ── Shared vertex shader (fullscreen quad) ──────────────────────
+var VS = [
+  'attribute vec2 a_pos;',
+  'varying vec2 vUv;',
+  'void main(){',
+  '  vUv = a_pos*0.5+0.5;',
+  '  gl_Position = vec4(a_pos,0.0,1.0);',
+  '}'
+].join('\n');
+
+// ── Fragment shaders ────────────────────────────────────────────
+// Source: injects heat + velocity from source texture into field
+var FS_SOURCE = [
+  'precision mediump float;',
+  'uniform sampler2D u_src;',
+  'uniform sampler2D u_den;',
+  'varying vec2 vUv;',
+  'void main(){',
+  '  vec4 s=texture2D(u_src,vUv);',
+  '  vec4 c=texture2D(u_den,vUv);',
+  // decode signed velocity from [0,1] → [-1,1]
+  '  vec2 v0=(c.gb-step(0.5,c.gb))*2.0;',
+  '  vec2 v1=(s.gb-step(0.5,s.gb))*2.0;',
+  '  vec2 nv=clamp(v0+v1,-0.99,0.99);',
+  // re-encode to [0,1]
+  '  nv=nv*0.5+step(0.0,-nv);',
+  '  float nd=clamp(s.r+c.a,0.0,1.0);',
+  '  float nt=clamp(s.r+c.r,0.0,1.0);',
+  '  gl_FragColor=vec4(nt,nv,nd);',
+  '}'
+].join('\n');
+
+// Diffuse: 5-tap Gauss-Seidel (vs original 9-tap) — 44% fewer texture fetches
+// Encodes: R=temperature  G=velX  B=velY  A=density
+var FS_DIFFUSE = [
+  'precision mediump float;',
+  'uniform float u_ow,u_oh;',
+  'uniform float u_diff,u_visc,u_exp,u_swirl,u_drag,u_burn;',
+  'uniform sampler2D u_den;',
+  'varying vec2 vUv;',
+  'void main(){',
+  '  vec4 dC=texture2D(u_den,vUv);',
+  '  vec4 dL=texture2D(u_den,vUv+vec2(-u_ow,0.0));',
+  '  vec4 dR=texture2D(u_den,vUv+vec2( u_ow,0.0));',
+  '  vec4 dU=texture2D(u_den,vUv+vec2(0.0,-u_oh));',
+  '  vec4 dD=texture2D(u_den,vUv+vec2(0.0, u_oh));',
+  // decode all velocities
+  '  dC.yz=(dC.yz-step(0.5,dC.yz))*2.0;',
+  '  dL.yz=(dL.yz-step(0.5,dL.yz))*2.0;',
+  '  dR.yz=(dR.yz-step(0.5,dR.yz))*2.0;',
+  '  dU.yz=(dU.yz-step(0.5,dU.yz))*2.0;',
+  '  dD.yz=(dD.yz-step(0.5,dD.yz))*2.0;',
+  // 5-tap diffusion solve
+  '  vec4 df=vec4(u_diff,u_visc,u_visc,u_diff);',
+  '  vec4 res=(dC+df*(dL+dR+dU+dD))/(1.0+4.0*df)-vec4(0.0,0.0,0.0,0.001);',
+  '  float temp=clamp(res.r-u_burn,0.0,1.0);',
+  '  vec2 vel=res.yz;',
+  // expansion force from density gradient
+  '  vec2 expv=vec2(dL.w-dR.w, dU.w-dD.w);',
+  // swirl from cross velocity gradients
+  '  vec2 swv=vec2((dL.z-dR.z)*0.5,(dU.y-dD.y)*0.5);',
+  '  vel+=(1.0-u_exp)*expv+(1.0-u_swirl)*swv;',
+  '  vel-=(1.0-u_drag)*vel;',
+  '  vec4 o=vec4(temp,vel*0.5+step(0.0,-vel),res.w);',
+  // zero out border to prevent wrapping artifacts
+  '  o*=step(u_ow,vUv.x)*step(u_oh,vUv.y)*step(vUv.x,1.0-u_ow)*step(vUv.y,1.0-u_oh);',
+  '  gl_FragColor=o;',
+  '}'
+].join('\n');
+
+// Drift: semi-Lagrangian advection (bilinear back-trace)
+var FS_DRIFT = [
+  'precision mediump float;',
+  'uniform float u_ow,u_oh,u_air;',
+  'uniform vec2 u_wind;',
+  'uniform sampler2D u_den;',
+  'varying vec2 vUv;',
+  'void main(){',
+  '  vec2 vel=texture2D(u_den,vUv).gb;',
+  '  vel=(vel-step(0.5,vel))*2.0;',
+  '  vel+=u_wind;',
+  // back-trace position
+  '  vec2 sp=vUv-u_air*vec2(u_ow,u_oh)*vel;',
+  '  vec2 units=sp/vec2(u_ow,u_oh);',
+  '  vec2 ip=floor(units)*vec2(u_ow,u_oh);',
+  '  vec2 fr=fract(units);',
+  // bilinear sample
+  '  vec4 d00=texture2D(u_den,ip+vec2(0.0,  -u_oh));',
+  '  vec4 d10=texture2D(u_den,ip+vec2(u_ow,  0.0 ));',
+  '  vec4 d01=texture2D(u_den,ip+vec2(0.0,   u_oh));',
+  '  vec4 d11=texture2D(u_den,ip+vec2(u_ow,  u_oh));',
+  '  d00.gb=(d00.gb-step(0.5,d00.gb))*2.0;',
+  '  d10.gb=(d10.gb-step(0.5,d10.gb))*2.0;',
+  '  d01.gb=(d01.gb-step(0.5,d01.gb))*2.0;',
+  '  d11.gb=(d11.gb-step(0.5,d11.gb))*2.0;',
+  '  vec4 src=mix(mix(d00,d10,fr.x),mix(d01,d11,fr.x),fr.y);',
+  '  src.gb=src.gb*0.5+step(0.0,-src.gb);',
+  '  gl_FragColor=src;',
+  '}'
+].join('\n');
+
+// Color: maps temperature + density to fire palette
+var FS_COLOR = [
+  'precision mediump float;',
+  'uniform vec3 u_c1,u_c2,u_c3;',
+  'uniform float u_bias;',
+  'uniform sampler2D u_den;',
+  'varying vec2 vUv;',
+  'void main(){',
+  '  vec4 data=texture2D(u_den,vUv);',
+  '  float t=data.r, d=data.a;',
+  '  float bias=clamp(u_bias,0.0001,0.9999);',
+  // two-segment color blend: color3→color2→color1
+  '  vec3 b1=mix(u_c3,u_c2,t/bias)*(1.0-step(bias,t));',
+  '  vec3 b2=mix(u_c2,u_c1,(t-bias)/(1.0-bias))*step(bias,t);',
+  '  gl_FragColor=vec4(b1+b2,d);',
+  '}'
+].join('\n');
+
+// ── Shader / program helpers ────────────────────────────────────
+function mkShader(type, src) {
+  var s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  return s;
+}
+function mkProg(fsrc) {
+  var p = gl.createProgram();
+  gl.attachShader(p, mkShader(gl.VERTEX_SHADER, VS));
+  gl.attachShader(p, mkShader(gl.FRAGMENT_SHADER, fsrc));
+  gl.linkProgram(p);
+  return p;
+}
+
+// ── FBO helper ──────────────────────────────────────────────────
+function mkFBO(w, h) {
+  var tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  var fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return {tex: tex, fbo: fbo};
+}
+
+// ── Build programs ──────────────────────────────────────────────
+var pSrc   = mkProg(FS_SOURCE);
+var pDiff  = mkProg(FS_DIFFUSE);
+var pDrift = mkProg(FS_DRIFT);
+var pColor = mkProg(FS_COLOR);
+
+// ── Fullscreen quad VBO ─────────────────────────────────────────
+var quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+
+// Cache attrib locations (all programs use 'a_pos')
+var aLoc = {
+  src:   gl.getAttribLocation(pSrc,   'a_pos'),
+  diff:  gl.getAttribLocation(pDiff,  'a_pos'),
+  drift: gl.getAttribLocation(pDrift, 'a_pos'),
+  color: gl.getAttribLocation(pColor, 'a_pos')
+};
+
+function setupAttrib(loc) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+}
+
+// ── Cache uniform locations ─────────────────────────────────────
+var uSrc = {
+  src: gl.getUniformLocation(pSrc, 'u_src'),
+  den: gl.getUniformLocation(pSrc, 'u_den')
+};
+var uDiff = {
+  ow:    gl.getUniformLocation(pDiff, 'u_ow'),
+  oh:    gl.getUniformLocation(pDiff, 'u_oh'),
+  diff:  gl.getUniformLocation(pDiff, 'u_diff'),
+  visc:  gl.getUniformLocation(pDiff, 'u_visc'),
+  exp_:  gl.getUniformLocation(pDiff, 'u_exp'),
+  swirl: gl.getUniformLocation(pDiff, 'u_swirl'),
+  drag:  gl.getUniformLocation(pDiff, 'u_drag'),
+  burn:  gl.getUniformLocation(pDiff, 'u_burn'),
+  den:   gl.getUniformLocation(pDiff, 'u_den')
+};
+var uDrift = {
+  ow:   gl.getUniformLocation(pDrift, 'u_ow'),
+  oh:   gl.getUniformLocation(pDrift, 'u_oh'),
+  air:  gl.getUniformLocation(pDrift, 'u_air'),
+  wind: gl.getUniformLocation(pDrift, 'u_wind'),
+  den:  gl.getUniformLocation(pDrift, 'u_den')
+};
+var uColor = {
+  c1:   gl.getUniformLocation(pColor, 'u_c1'),
+  c2:   gl.getUniformLocation(pColor, 'u_c2'),
+  c3:   gl.getUniformLocation(pColor, 'u_c3'),
+  bias: gl.getUniformLocation(pColor, 'u_bias'),
+  den:  gl.getUniformLocation(pColor, 'u_den')
+};
+
+// Pre-bake static uniforms (only set once)
+var OW = 1.0 / SIM_W, OH = 1.0 / SIM_H;
+
+gl.useProgram(pDiff);
+gl.uniform1f(uDiff.ow, OW);  gl.uniform1f(uDiff.oh, OH);
+gl.uniform1i(uDiff.den, 0);
+
+gl.useProgram(pDrift);
+gl.uniform1f(uDrift.ow, OW); gl.uniform1f(uDrift.oh, OH);
+gl.uniform1i(uDrift.den, 0);
+
+gl.useProgram(pSrc);
+gl.uniform1i(uSrc.src, 0);
+gl.uniform1i(uSrc.den, 1);
+
+gl.useProgram(pColor);
+gl.uniform3fv(uColor.c1, C.color1);
+gl.uniform3fv(uColor.c2, C.color2);
+gl.uniform3fv(uColor.c3, C.color3);
+gl.uniform1f(uColor.bias, C.colorBias);
+gl.uniform1i(uColor.den, 0);
+
+// ── Source texture ──────────────────────────────────────────────
+// RGBA: R=density  G=velX(encoded)  B=velY(encoded)  A=unused
+// Encoding: positive v → v*127  |  negative v → v*127+255
+// campfire: single source at center-bottom, full density, upward wind
+var srcData = new Uint8Array(SIM_W * SIM_H * 4);
+(function buildCampfireSource() {
+  var cx = 0.5, cy = 0.12, r = 0.1, r2 = r * r;
+  var x0 = Math.max(0, Math.floor((cx-r)*SIM_W));
+  var x1 = Math.min(SIM_W, Math.ceil((cx+r)*SIM_W));
+  var y0 = Math.max(0, Math.floor((cy-r)*SIM_H));
+  var y1 = Math.min(SIM_H, Math.ceil((cy+r)*SIM_H));
+  for (var y = y0; y < y1; y++) {
+    for (var x = x0; x < x1; x++) {
+      var du = x/SIM_W - cx, dv = y/SIM_H - cy;
+      if (du*du + dv*dv < r2) {
+        var i = (y*SIM_W + x)*4;
+        srcData[i]   = 255; // density = 1.0
+        srcData[i+1] = 0;   // windX = 0
+        srcData[i+2] = 127; // windY = +1.0 → 127
+        srcData[i+3] = 0;
+      }
+    }
+  }
+})();
+
+var srcTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, srcTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, SIM_W, SIM_H, 0, gl.RGBA, gl.UNSIGNED_BYTE, srcData);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+// ── Ping-pong framebuffers ──────────────────────────────────────
+var fbo0 = mkFBO(SIM_W, SIM_H);
+var fbo1 = mkFBO(SIM_W, SIM_H);
+function swap(){ var t=fbo0; fbo0=fbo1; fbo1=t; }
+
+function bindTex(unit, tex) {
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+}
+function drawToFBO(targetFBO) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, targetFBO);
+  gl.viewport(0, 0, SIM_W, SIM_H);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+// ── Wind interaction (touch + mouse) ───────────────────────────
+var windTarget = [C.windX, C.windY];
+var windCur    = [C.windX, C.windY];
+var pointerActive = false;
+
+function onPointer(e) {
+  var x = (e.touches ? e.touches[0].clientX : e.clientX) / window.innerWidth;
+  // map horizontal position to wind X: -2..2
+  windTarget[0] = (x - 0.5) * 4.0;
+  pointerActive = true;
+}
+function onPointerEnd() {
+  windTarget[0] = 0.0;
+  pointerActive = false;
+}
+
+fc.addEventListener('mousemove',  onPointer, {passive:true});
+fc.addEventListener('touchmove',  onPointer, {passive:true});
+fc.addEventListener('mouseup',    onPointerEnd);
+fc.addEventListener('touchend',   onPointerEnd);
+
+// ── Canvas 2D logs overlay ──────────────────────────────────────
+function drawLogs() {
+  var ctx = sc.getContext('2d');
+  var w = sc.width, h = sc.height;
+  ctx.clearRect(0, 0, w, h);
+
+  var cx   = w * 0.5;
+  var cy   = h * 0.86;
+  var scl  = Math.min(w, h) * 0.22;
+
+  // Shadow/glow under fire source
+  var glow = ctx.createRadialGradient(cx, cy - scl*0.3, 0, cx, cy - scl*0.1, scl*0.55);
+  glow.addColorStop(0,   'rgba(255,120,0,0.35)');
+  glow.addColorStop(0.5, 'rgba(180,50,0,0.15)');
+  glow.addColorStop(1,   'rgba(0,0,0,0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy - scl*0.1, scl*0.55, scl*0.28, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  ctx.save();
+  ctx.translate(cx, cy);
+
+  // Draw a single log
+  function drawLog(angle, len, thick, shade) {
+    ctx.save();
+    ctx.rotate(angle);
+    var g = ctx.createLinearGradient(0, -thick, 0, thick);
+    g.addColorStop(0,   shade === 1 ? '#5a2800' : '#4a2000');
+    g.addColorStop(0.4, shade === 1 ? '#6e3200' : '#5c2a00');
+    g.addColorStop(1,   shade === 1 ? '#2e1200' : '#261000');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, len*0.5, thick, 0, 0, Math.PI*2);
+    ctx.fill();
+    // end grain circles
+    var eg = ctx.createRadialGradient(-len*0.5, 0, 0, -len*0.5, 0, thick);
+    eg.addColorStop(0, '#7a3a00');
+    eg.addColorStop(1, '#3a1800');
+    ctx.fillStyle = eg;
+    ctx.beginPath();
+    ctx.ellipse(-len*0.5, 0, thick*0.65, thick, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse( len*0.5, 0, thick*0.65, thick, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  drawLog( Math.PI*0.13, scl*0.9, scl*0.06, 1);
+  drawLog(-Math.PI*0.13, scl*0.9, scl*0.06, 0);
+  drawLog( Math.PI*0.42, scl*0.78, scl*0.052, 0);
+  drawLog(-Math.PI*0.42, scl*0.78, scl*0.052, 1);
+
+  // Ember glow at center
+  var eg2 = ctx.createRadialGradient(0, 0, 0, 0, 0, scl*0.28);
+  eg2.addColorStop(0,   'rgba(255,160,0,0.7)');
+  eg2.addColorStop(0.4, 'rgba(220,80,0,0.4)');
+  eg2.addColorStop(1,   'rgba(0,0,0,0)');
+  ctx.fillStyle = eg2;
+  ctx.beginPath();
+  ctx.ellipse(0, scl*0.04, scl*0.28, scl*0.1, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  ctx.restore();
+
+  // Stone ring around base
+  var sg = ctx.createRadialGradient(cx, cy+scl*0.12, scl*0.05, cx, cy+scl*0.15, scl*0.52);
+  sg.addColorStop(0, 'rgba(90,80,70,0.9)');
+  sg.addColorStop(0.7, 'rgba(45,40,35,0.85)');
+  sg.addColorStop(1, 'rgba(20,18,15,0)');
+  ctx.fillStyle = sg;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy+scl*0.15, scl*0.52, scl*0.13, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  // Ground shadow
+  var gs = ctx.createRadialGradient(cx, cy+scl*0.3, 0, cx, cy+scl*0.3, scl*0.7);
+  gs.addColorStop(0, 'rgba(0,0,0,0.6)');
+  gs.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = gs;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy+scl*0.3, scl*0.7, scl*0.18, 0, 0, Math.PI*2);
+  ctx.fill();
+}
+
+// ── Resize ──────────────────────────────────────────────────────
+function resize() {
+  var w = window.innerWidth, h = window.innerHeight;
+  fc.width  = w; fc.height  = h;
+  sc.width  = w; sc.height  = h;
+  drawLogs();
+}
+window.addEventListener('resize', function(){ resize(); }, {passive:true});
+window.addEventListener('orientationchange', function(){ resize(); }, {passive:true});
+resize();
+
+// ── Render loop ─────────────────────────────────────────────────
+var lastT = 0;
+
+function frame(t) {
+  requestAnimationFrame(frame);
+
+  var dt = Math.min((t - lastT) * 0.001, 0.1);
+  lastT = t;
+  if (dt <= 0) return;
+
+  // Smooth wind interpolation
+  windCur[0] += (windTarget[0] - windCur[0]) * 0.08;
+  windCur[1]  = C.windY;
+
+  // Per-frame uniform values — all expensive ops (exp) done once on CPU
+  var step    = dt * C.speed * 0.1;
+  var diffVal = step * 0.05 * C.diffuse;
+  var viscVal = step * 0.05 * C.viscosity;
+  var expVal  = Math.exp(-C.expansion);        // expansion = Math.exp(expansion * -1)
+  var swiVal  = Math.exp(-C.swirl * 0.1);      // swirl
+  var dragVal = Math.exp(-C.drag  * 0.1);      // drag
+  var burnVal = C.burnRate * step * 0.01;
+  var airVal  = step * C.airSpeed * 0.001 * SIM_H;
+
+  // ── Pass 1: Source injection ──────────────────────────────
+  gl.useProgram(pSrc);
+  setupAttrib(aLoc.src);
+  bindTex(0, srcTex);
+  bindTex(1, fbo0.tex);
+  drawToFBO(fbo1.fbo);
+  swap();
+
+  // ── Passes 2-6: Diffuse (no expansion/swirl/drag forces) ──
+  gl.useProgram(pDiff);
+  setupAttrib(aLoc.diff);
+  gl.uniform1f(uDiff.exp_,  1.0);  // (1-1)*expv = 0  → no expansion force
+  gl.uniform1f(uDiff.swirl, 1.0);  // (1-1)*swv  = 0  → no swirl force
+  gl.uniform1f(uDiff.drag,  1.0);  // (1-1)*vel  = 0  → no drag
+  gl.uniform1f(uDiff.burn,  0.0);
+  gl.uniform1f(uDiff.diff,  diffVal);
+  gl.uniform1f(uDiff.visc,  viscVal);
+  for (var i = 0; i < 5; i++) {
+    bindTex(0, fbo0.tex);
+    drawToFBO(fbo1.fbo);
+    swap();
+  }
+
+  // ── Pass 7: Diffuse with full forces ──────────────────────
+  gl.uniform1f(uDiff.exp_,  expVal);
+  gl.uniform1f(uDiff.swirl, swiVal);
+  gl.uniform1f(uDiff.drag,  dragVal);
+  gl.uniform1f(uDiff.burn,  burnVal);
+  bindTex(0, fbo0.tex);
+  drawToFBO(fbo1.fbo);
+  swap();
+
+  // ── Pass 8: Drift (semi-Lagrangian advection) ─────────────
+  gl.useProgram(pDrift);
+  setupAttrib(aLoc.drift);
+  gl.uniform2f(uDrift.wind, windCur[0], windCur[1]);
+  gl.uniform1f(uDrift.air,  airVal);
+  bindTex(0, fbo0.tex);
+  drawToFBO(fbo1.fbo);
+  swap();
+
+  // ── Pass 9: Display to screen with fire palette ───────────
+  gl.useProgram(pColor);
+  setupAttrib(aLoc.color);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, fc.width, fc.height);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  bindTex(0, fbo0.tex);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
